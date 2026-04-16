@@ -155,3 +155,139 @@ describe('extractSymbols — cross-package calls', () => {
     expect(crossCall).toBeDefined();
   });
 });
+
+// ── New feature tests ─────────────────────────────────────────────────────
+
+describe('extractSymbols — DML classification', () => {
+  it('classifies INSERT accesses with dmlOperation', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const accesses = result.relations.filter((r) => r.kind === 'ACCESSES');
+
+    // log_event inserts into order_audit_log
+    const insertAccess = accesses.find(
+      (a) => a.targetName === 'ORDER_AUDIT_LOG' && a.dmlOperation === 'INSERT',
+    );
+    expect(insertAccess).toBeDefined();
+  });
+
+  it('classifies SELECT accesses with dmlOperation', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const accesses = result.relations.filter((r) => r.kind === 'ACCESSES');
+
+    // get_order_total selects from orders
+    const selectAccess = accesses.find(
+      (a) => a.targetName === 'ORDERS' && a.dmlOperation === 'SELECT',
+    );
+    expect(selectAccess).toBeDefined();
+  });
+
+  it('classifies UPDATE accesses with dmlOperation', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const accesses = result.relations.filter((r) => r.kind === 'ACCESSES');
+
+    // submit_order or cancel_order updates orders
+    const updateAccess = accesses.find(
+      (a) => a.targetName === 'ORDERS' && a.dmlOperation === 'UPDATE',
+    );
+    expect(updateAccess).toBeDefined();
+  });
+
+  it('produces per-DML entries for the same table', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const ordersAccesses = result.relations.filter(
+      (r) => r.kind === 'ACCESSES' && r.targetName === 'ORDERS',
+    );
+
+    const dmlOps = new Set(ordersAccesses.map((a) => a.dmlOperation));
+    // ORDERS is used in INSERT, UPDATE, and SELECT
+    expect(dmlOps.has('INSERT')).toBe(true);
+    expect(dmlOps.has('UPDATE')).toBe(true);
+    expect(dmlOps.has('SELECT')).toBe(true);
+  });
+});
+
+describe('extractSymbols — line numbers', () => {
+  it('includes line numbers on ACCESSES relations', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const accesses = result.relations.filter((r) => r.kind === 'ACCESSES');
+
+    // Every access should have a line number
+    for (const access of accesses) {
+      expect(access.line).toBeGreaterThan(0);
+    }
+  });
+
+  it('includes line numbers on CALLS relations from general elements', () => {
+    const result = extractSymbols('package-body.pkb', readFixture('package-body.pkb'));
+    const calls = result.relations.filter((r) => r.kind === 'CALLS');
+
+    // At least some calls should have line numbers
+    const withLine = calls.filter((c) => c.line && c.line > 0);
+    expect(withLine.length).toBeGreaterThan(0);
+  });
+});
+
+describe('extractSymbols — string literal arguments', () => {
+  it('extracts string literal arguments from function calls', () => {
+    const sql = `CREATE OR REPLACE PROCEDURE test_config AS
+      v_val VARCHAR2(100);
+    BEGIN
+      v_val := fn_get_setting('MY_CONFIG_KEY');
+    END test_config;`;
+    const result = extractSymbols('test.sql', sql);
+    const call = result.relations.find(
+      (r) => r.kind === 'CALLS' && r.targetName === 'FN_GET_SETTING',
+    );
+    expect(call).toBeDefined();
+    expect(call!.stringArgs).toBeDefined();
+    expect(call!.stringArgs).toContain('MY_CONFIG_KEY');
+  });
+});
+
+describe('extractSymbols — cursor extraction', () => {
+  it('extracts cursor declarations as symbols', () => {
+    const sql = `CREATE OR REPLACE PROCEDURE process_orders AS
+      CURSOR c_active_orders IS
+        SELECT order_id, total FROM orders WHERE status = 'ACTIVE';
+      v_id NUMBER;
+    BEGIN
+      FOR rec IN c_active_orders LOOP
+        v_id := rec.order_id;
+      END LOOP;
+    END process_orders;`;
+    const result = extractSymbols('test.sql', sql);
+    const cursor = result.symbols.find((s) => s.kind === 'cursor');
+    expect(cursor).toBeDefined();
+    expect(cursor!.name).toBe('C_ACTIVE_ORDERS');
+    expect(cursor!.owner).toBe('PROCESS_ORDERS');
+  });
+
+  it('creates CONTAINS relation for cursors', () => {
+    const sql = `CREATE OR REPLACE PROCEDURE process_orders AS
+      CURSOR c_active_orders IS
+        SELECT order_id FROM orders WHERE status = 'ACTIVE';
+    BEGIN
+      NULL;
+    END process_orders;`;
+    const result = extractSymbols('test.sql', sql);
+    const contains = result.relations.find(
+      (r) => r.kind === 'CONTAINS' && r.targetName === 'C_ACTIVE_ORDERS',
+    );
+    expect(contains).toBeDefined();
+    expect(contains!.sourceName).toBe('PROCESS_ORDERS');
+  });
+
+  it('extracts table accesses from cursor SELECT', () => {
+    const sql = `CREATE OR REPLACE PROCEDURE process_orders AS
+      CURSOR c_active_orders IS
+        SELECT order_id FROM orders WHERE status = 'ACTIVE';
+    BEGIN
+      NULL;
+    END process_orders;`;
+    const result = extractSymbols('test.sql', sql);
+    const access = result.relations.find(
+      (r) => r.kind === 'ACCESSES' && r.targetName === 'ORDERS' && r.dmlOperation === 'SELECT',
+    );
+    expect(access).toBeDefined();
+  });
+});

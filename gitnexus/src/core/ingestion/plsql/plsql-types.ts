@@ -62,6 +62,10 @@ export interface ExtractedRelation {
   readonly targetName: string;
   readonly dmlOperation?: DmlOperation;
   readonly triggerEvent?: string;
+  /** 1-based line number where this relation occurs in the source. */
+  readonly line?: number;
+  /** String literal arguments passed at the call site (e.g. config keys). */
+  readonly stringArgs?: readonly string[];
 }
 
 /** Result of extracting symbols from a single PL/SQL file. */

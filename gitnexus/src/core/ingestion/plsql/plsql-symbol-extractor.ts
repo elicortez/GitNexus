@@ -17,6 +17,7 @@ import type {
   FileExtractionResult,
   PlSqlParamMode,
   ExtractedParam,
+  DmlOperation,
 } from './plsql-types.js';
 import { normalizeIdentifier } from './plsql-utils.js';
 
@@ -259,7 +260,7 @@ function extractPackageBodyMembers(
         relations.push({ kind: 'CONTAINS', sourceName: packageName, targetName: pName });
 
         // Extract calls inside this procedure
-        extractCallsAndAccesses(child, pName, relations);
+        extractCallsAndAccesses(child, pName, relations, symbols, filePath, originalContent);
       }
       return 'skip'; // Don't recurse into procedure body children
     } else if (child.ruleIndex === PlSqlParser.RULE_function_body) {
@@ -282,7 +283,7 @@ function extractPackageBodyMembers(
         relations.push({ kind: 'CONTAINS', sourceName: packageName, targetName: fName });
 
         // Extract calls inside this function
-        extractCallsAndAccesses(child, fName, relations);
+        extractCallsAndAccesses(child, fName, relations, symbols, filePath, originalContent);
       }
       return 'skip'; // Don't recurse into function body children
     }
@@ -315,7 +316,7 @@ function extractStandaloneProcedure(
   });
 
   // Extract calls inside this procedure
-  extractCallsAndAccesses(ctx, name, relations);
+  extractCallsAndAccesses(ctx, name, relations, symbols, filePath, originalContent);
 }
 
 function extractStandaloneFunction(
@@ -344,7 +345,7 @@ function extractStandaloneFunction(
   });
 
   // Extract calls inside this function
-  extractCallsAndAccesses(ctx, name, relations);
+  extractCallsAndAccesses(ctx, name, relations, symbols, filePath, originalContent);
 }
 
 // ── Trigger extraction ────────────────────────────────────────────────────
@@ -392,6 +393,9 @@ function extractCallsAndAccesses(
   ctx: any,
   currentSymbolName: string,
   relations: ExtractedRelation[],
+  symbols?: ExtractedSymbol[],
+  filePath?: string,
+  originalContent?: string,
 ): void {
   const seenCalls = new Set<string>();
   const seenAccesses = new Set<string>();
@@ -405,11 +409,36 @@ function extractCallsAndAccesses(
       return 'skip'; // Signal to skip this subtree
     }
 
+    // Cursor declarations: CURSOR name IS SELECT ...
+    if (child.ruleIndex === PlSqlParser.RULE_cursor_declaration && symbols && filePath) {
+      const nameCtx = child.identifier?.();
+      if (nameCtx) {
+        const cursorName = getIdentifierText(nameCtx);
+        const { startLine, endLine } = getLineRange(child, originalContent ?? '');
+        symbols.push({
+          kind: 'cursor',
+          name: cursorName,
+          owner: currentSymbolName,
+          filePath,
+          startLine,
+          endLine,
+        });
+        relations.push({ kind: 'CONTAINS', sourceName: currentSymbolName, targetName: cursorName });
+
+        // Extract table accesses from the cursor's SELECT statement
+        const selectStmt = child.select_statement?.();
+        if (selectStmt) {
+          extractTableAccesses(selectStmt, currentSymbolName, relations, seenAccesses, 'SELECT');
+        }
+      }
+    }
+
     // Call statements: CALL pkg.proc(args)
     if (child.ruleIndex === PlSqlParser.RULE_call_statement) {
       const routineNames = child.routine_name_list?.();
       if (routineNames && routineNames.length > 0) {
         const targetName = getIdentifierText(routineNames[0]);
+        const line = child.start?.line;
         const key = `${currentSymbolName}->${targetName}`;
         if (targetName && !seenCalls.has(key)) {
           seenCalls.add(key);
@@ -417,6 +446,7 @@ function extractCallsAndAccesses(
             kind: 'CALLS',
             sourceName: currentSymbolName,
             targetName,
+            line,
           });
         }
       }
@@ -424,34 +454,58 @@ function extractCallsAndAccesses(
 
     // General element calls: pkg.proc(args) or proc(args) as expression statements
     if (child.ruleIndex === PlSqlParser.RULE_general_element) {
-      const callTarget = extractCallFromGeneralElement(child);
-      if (callTarget) {
-        const key = `${currentSymbolName}->${callTarget}`;
+      const callInfo = extractCallFromGeneralElement(child);
+      if (callInfo) {
+        const key = `${currentSymbolName}->${callInfo.name}`;
         if (!seenCalls.has(key)) {
           seenCalls.add(key);
           relations.push({
             kind: 'CALLS',
             sourceName: currentSymbolName,
-            targetName: callTarget,
+            targetName: callInfo.name,
+            line: callInfo.line,
+            stringArgs: callInfo.stringArgs.length > 0 ? callInfo.stringArgs : undefined,
           });
+        } else if (callInfo.stringArgs.length > 0) {
+          // Aggregate string args from duplicate calls into the existing relation
+          const existing = relations.find(
+            (r) =>
+              r.kind === 'CALLS' &&
+              r.sourceName === currentSymbolName &&
+              r.targetName === callInfo.name,
+          );
+          if (existing) {
+            const merged = new Set([...(existing.stringArgs ?? []), ...callInfo.stringArgs]);
+            // Replace with updated relation (readonly workaround)
+            const idx = relations.indexOf(existing);
+            relations[idx] = { ...existing, stringArgs: [...merged] };
+          }
         }
       }
     }
 
-    // DML: INSERT, UPDATE, DELETE, SELECT — extract ACCESSES edges
-    if (
-      child.ruleIndex === PlSqlParser.RULE_insert_statement ||
-      child.ruleIndex === PlSqlParser.RULE_update_statement ||
-      child.ruleIndex === PlSqlParser.RULE_delete_statement ||
-      child.ruleIndex === PlSqlParser.RULE_select_statement ||
-      child.ruleIndex === PlSqlParser.RULE_merge_statement
-    ) {
-      extractTableAccesses(child, currentSymbolName, relations, seenAccesses);
+    // DML: INSERT, UPDATE, DELETE, SELECT — extract ACCESSES edges with DML type
+    if (child.ruleIndex === PlSqlParser.RULE_insert_statement) {
+      extractTableAccesses(child, currentSymbolName, relations, seenAccesses, 'INSERT');
+    } else if (child.ruleIndex === PlSqlParser.RULE_update_statement) {
+      extractTableAccesses(child, currentSymbolName, relations, seenAccesses, 'UPDATE');
+    } else if (child.ruleIndex === PlSqlParser.RULE_delete_statement) {
+      extractTableAccesses(child, currentSymbolName, relations, seenAccesses, 'DELETE');
+    } else if (child.ruleIndex === PlSqlParser.RULE_merge_statement) {
+      extractTableAccesses(child, currentSymbolName, relations, seenAccesses, 'MERGE');
+    } else if (child.ruleIndex === PlSqlParser.RULE_select_statement) {
+      extractTableAccesses(child, currentSymbolName, relations, seenAccesses, 'SELECT');
     }
   });
 }
 
-function extractCallFromGeneralElement(ctx: any): string | null {
+interface CallInfo {
+  name: string;
+  line?: number;
+  stringArgs: string[];
+}
+
+function extractCallFromGeneralElement(ctx: any): CallInfo | null {
   // A general_element is a function/procedure call if any of its
   // general_element_part children have function_argument children.
   //
@@ -470,10 +524,12 @@ function extractCallFromGeneralElement(ctx: any): string | null {
 
   // Check if any part has function_argument (indicates a call)
   let hasCallArgs = false;
+  let funcArgCtx: any = null;
   for (const part of parts) {
     const funcArgs = part.function_argument_list?.();
     if (funcArgs && funcArgs.length > 0) {
       hasCallArgs = true;
+      funcArgCtx = funcArgs[0];
       break;
     }
   }
@@ -498,7 +554,44 @@ function extractCallFromGeneralElement(ctx: any): string | null {
     }
   }
 
-  return nameParts.length > 0 ? nameParts.join('.') : null;
+  if (nameParts.length === 0) return null;
+
+  // Extract string literal arguments
+  const stringArgs = extractStringLiteralArgs(funcArgCtx);
+
+  return {
+    name: nameParts.join('.'),
+    line: ctx.start?.line,
+    stringArgs,
+  };
+}
+
+/**
+ * Extract string literal arguments from a function_argument context.
+ * Walks the argument subtree to find string literals at any depth.
+ * Returns de-quoted uppercase strings (e.g., 'MY_KEY' → MY_KEY).
+ */
+function extractStringLiteralArgs(funcArgCtx: any): string[] {
+  if (!funcArgCtx) return [];
+  const args: string[] = [];
+  try {
+    const argList = funcArgCtx.argument_list?.();
+    if (!argList || argList.length === 0) return [];
+    for (const arg of argList) {
+      // Walk the full argument text looking for string literals
+      const text = arg.getText();
+      // Match all PL/SQL string literals: 'value' anywhere in the expression
+      const matches = text.matchAll(/'([^']*)'/g);
+      for (const match of matches) {
+        if (match[1]) {
+          args.push(match[1]);
+        }
+      }
+    }
+  } catch {
+    // Gracefully handle unexpected grammar shapes
+  }
+  return args;
 }
 
 function extractTableAccesses(
@@ -506,17 +599,21 @@ function extractTableAccesses(
   currentSymbolName: string,
   relations: ExtractedRelation[],
   seenAccesses: Set<string>,
+  dmlOperation: DmlOperation,
 ): void {
   visitDescendants(ctx, (child: any) => {
     if (child.ruleIndex === PlSqlParser.RULE_tableview_name) {
       const tableName = getIdentifierText(child);
-      const key = `${currentSymbolName}->${tableName}`;
+      // Use DML-qualified key so the same table can appear as both SELECT and INSERT
+      const key = `${currentSymbolName}->${tableName}:${dmlOperation}`;
       if (tableName && !seenAccesses.has(key)) {
         seenAccesses.add(key);
         relations.push({
           kind: 'ACCESSES',
           sourceName: currentSymbolName,
           targetName: tableName,
+          dmlOperation,
+          line: child.start?.line,
         });
       }
     }
@@ -527,38 +624,49 @@ function extractTableAccesses(
 
 function extractParameters(ctx: any): ExtractedParam[] {
   const params: ExtractedParam[] = [];
-  const paramList = ctx.parameter_list?.();
-  if (!paramList || paramList.length === 0) return params;
+  try {
+    const paramList = ctx.parameter_list?.();
+    if (!paramList || !Array.isArray(paramList) || paramList.length === 0) return params;
 
-  for (const paramCtx of paramList) {
-    const nameCtx = paramCtx.parameter_name?.();
-    if (!nameCtx) continue;
+    for (const paramCtx of paramList) {
+      try {
+        const nameCtx = paramCtx.parameter_name?.();
+        if (!nameCtx) continue;
 
-    const name = normalizeIdentifier(nameCtx.getText());
+        const name = normalizeIdentifier(nameCtx.getText());
 
-    let mode: PlSqlParamMode = 'IN'; // default
-    try {
-      if (paramCtx.INOUT?.(0)) {
-        mode = 'IN OUT';
-      } else if (paramCtx.OUT?.(0)) {
-        mode = 'OUT';
+        let mode: PlSqlParamMode = 'IN'; // default
+        try {
+          // Check for INOUT first (must come before OUT check)
+          const inoutTokens = paramCtx.INOUT_list?.();
+          const outTokens = paramCtx.OUT_list?.();
+          if (inoutTokens && inoutTokens.length > 0) {
+            mode = 'IN OUT';
+          } else if (outTokens && outTokens.length > 0) {
+            mode = 'OUT';
+          }
+          // IN is default
+        } catch {
+          // Some contexts don't have these methods
+        }
+
+        let type = '';
+        try {
+          const typeCtx = paramCtx.type_spec?.();
+          if (typeCtx) {
+            type = normalizeIdentifier(typeCtx.getText());
+          }
+        } catch {
+          // type_spec may not exist
+        }
+
+        params.push({ name, type, mode });
+      } catch {
+        // Skip individual parameter if extraction fails
       }
-      // IN is default, no explicit check needed
-    } catch {
-      // Some contexts don't have these methods
     }
-
-    let type = '';
-    try {
-      const typeCtx = paramCtx.type_spec?.();
-      if (typeCtx) {
-        type = normalizeIdentifier(typeCtx.getText());
-      }
-    } catch {
-      // type_spec may not exist
-    }
-
-    params.push({ name, type, mode });
+  } catch {
+    // parameter_list accessor not available on this context type
   }
 
   return params;

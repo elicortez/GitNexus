@@ -10,7 +10,7 @@
 
 import type { PipelinePhase, PipelineContext, PhaseResult } from './types.js';
 import { getPhaseOutput } from './types.js';
-import { isPlSqlFile } from '../plsql/plsql-utils.js';
+import { isPlSqlFile, isPlSqlContent } from '../plsql/plsql-utils.js';
 import { readFileContents } from '../filesystem-walker.js';
 import { processPlSql } from '../plsql-processor.js';
 import type { StructureOutput } from './structure.js';
@@ -33,7 +33,26 @@ export const plsqlPhase: PipelinePhase<PlSqlOutput> = {
   ): Promise<PlSqlOutput> {
     const { scannedFiles } = getPhaseOutput<StructureOutput>(deps, 'structure');
 
-    const plsqlScanned = scannedFiles.filter((f) => isPlSqlFile(f.path));
+    // Files with known PL/SQL extensions are always included
+    const plsqlByExtension = scannedFiles.filter((f) => isPlSqlFile(f.path));
+
+    // .sql files need content-based heuristic detection
+    const sqlFiles = scannedFiles.filter((f) => f.path.endsWith('.sql') && !isPlSqlFile(f.path));
+
+    // Read .sql file contents for heuristic check
+    let sqlWithPlSql: typeof scannedFiles = [];
+    if (sqlFiles.length > 0) {
+      const sqlContents = await readFileContents(
+        ctx.repoPath,
+        sqlFiles.map((f) => f.path),
+      );
+      sqlWithPlSql = sqlFiles.filter((f) => {
+        const content = sqlContents.get(f.path);
+        return content && isPlSqlContent(content);
+      });
+    }
+
+    const plsqlScanned = [...plsqlByExtension, ...sqlWithPlSql];
 
     if (plsqlScanned.length === 0) {
       return { packages: 0, procedures: 0, functions: 0, triggers: 0 };

@@ -125,6 +125,11 @@ export function mapToGraph(
     // Target may be in this file or cross-file (unresolved)
     const targetId = nameToNodeId.get(rel.targetName) ?? `<unresolved>:${rel.targetName}`;
     const relType = RELATION_KIND_TO_TYPE[rel.kind] ?? rel.kind;
+    // Encode DML operation in reason for ACCESSES edges (e.g., "plsql-accesses-insert")
+    let reason = `plsql-${rel.kind.toLowerCase()}`;
+    if (rel.dmlOperation) {
+      reason = `plsql-${rel.kind.toLowerCase()}-${rel.dmlOperation.toLowerCase()}`;
+    }
 
     graph.addRelationship({
       id: generateId(relType, `${sourceId}->${targetId}`),
@@ -133,7 +138,7 @@ export function mapToGraph(
       sourceId,
       targetId,
       confidence: 1.0,
-      reason: `plsql-${rel.kind.toLowerCase()}`,
+      reason,
     });
   }
 

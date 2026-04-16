@@ -1,0 +1,3 @@
+CREATE OR REPLACE PACKAGE BODY empty_pkg AS
+END empty_pkg;
+/

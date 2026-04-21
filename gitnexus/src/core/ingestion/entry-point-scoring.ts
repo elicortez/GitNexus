@@ -228,6 +228,7 @@ export const ENTRY_POINT_PATTERNS = {
   ],
   [SupportedLanguages.Vue]: [], // Vue uses TypeScript queries — entry points handled via TS patterns
   [SupportedLanguages.Cobol]: [], // Standalone regex processor — no tree-sitter entry points
+  [SupportedLanguages.PlSql]: [], // Standalone ANTLR4 processor — no tree-sitter entry points
 } satisfies Record<SupportedLanguages, RegExp[]>;
 
 /** Pre-computed merged patterns (universal + language-specific) to avoid per-call array allocation. */

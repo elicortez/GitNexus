@@ -42,9 +42,14 @@ import {
 } from '../heritage-processor.js';
 import { createResolutionContext } from '../model/resolution-context.js';
 import { createASTCache } from '../ast-cache.js';
-import { type PipelineProgress, getLanguageFromFilename } from 'gitnexus-shared';
+import {
+  type PipelineProgress,
+  getLanguageFromFilename,
+  SupportedLanguages,
+} from 'gitnexus-shared';
 import { readFileContents } from '../filesystem-walker.js';
 import { isLanguageAvailable } from '../../tree-sitter/parser-loader.js';
+import { getProvider } from '../languages/index.js';
 import { createWorkerPool } from '../workers/worker-pool.js';
 import type { WorkerPool } from '../workers/worker-pool.js';
 import type {
@@ -118,11 +123,13 @@ export async function runChunkedParseAndResolve(
     return lang && isLanguageAvailable(lang);
   });
 
-  // Warn about files skipped due to unavailable parsers
+  // Warn about files skipped due to unavailable parsers (exclude standalone languages — they have their own pipeline phases)
   const skippedByLang = new Map<string, number>();
   for (const f of scannedFiles) {
     const lang = getLanguageFromFilename(f.path);
     if (lang && !isLanguageAvailable(lang)) {
+      const provider = getProvider(lang as SupportedLanguages);
+      if (provider?.parseStrategy === 'standalone') continue;
       skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
     }
   }
